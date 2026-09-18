@@ -1,107 +1,196 @@
 import express from 'express';
-import crypto from 'node:crypto';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { Pool } from 'pg';
+import pg from 'pg';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = process.env.PORT || 10000;
-const ownerLogin = process.env.OWNER_LOGIN || 'brngzn03';
-const ownerPassword = process.env.OWNER_PASSWORD || 'Cocolimbo03';
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.PORT || 3000;
+
+// Подключение к PostgreSQL
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Настройки администратора
+const OWNER_LOGIN = process.env.OWNER_LOGIN || 'brngzn03';
+const OWNER_PASSWORD = process.env.OWNER_PASSWORD || 'change-this-password';
+const OWNER_TOKEN = 'secret-restart-owner-token'; // Токен авторизации
+
 app.use(express.json());
-
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
-
-const rooms = [1, 2, 3, 4].map((number) => ({
-  id: number, name: `VIP ${String(number).padStart(2, '0')}`,
-  status: number === 2 ? 'busy' : 'free', occupiedUntil: number === 2 ? Date.now() + 46 * 60 * 1000 : null,
-  guest: number === 2 ? 'Алексей' : null
-}));
-let news = [];
-const ownerSessions = new Set();
-
-async function initDatabase() {
-  if (!pool) return;
-  await pool.query(`CREATE TABLE IF NOT EXISTS reservations (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    phone TEXT,
-    room_id INTEGER NOT NULL CHECK (room_id BETWEEN 1 AND 4),
-    reservation_time TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-    client_token TEXT UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await pool.query('ALTER TABLE reservations ADD COLUMN IF NOT EXISTS client_token TEXT UNIQUE');
-  await pool.query('ALTER TABLE reservations ALTER COLUMN phone DROP NOT NULL');
-}
-
-function reservationFromRow(row) {
-  return { id: Number(row.id), name: row.name, roomId: row.room_id, time: row.reservation_time, status: row.status, clientToken: row.client_token, createdAt: row.created_at };
-}
-
-function isOwner(req) {
-  return ownerSessions.has((req.headers.authorization || '').replace('Bearer ', ''));
-}
-
-app.post('/api/auth/login', (req, res) => {
-  const { login, password } = req.body || {};
-  if (login === ownerLogin && password === ownerPassword) {
-    const token = crypto.randomUUID();
-    ownerSessions.add(token);
-    return res.json({ ok: true, token });
-  }
-  return res.status(401).json({ ok: false, message: 'Неверный логин или пароль' });
-});
-app.get('/api/rooms', (_req, res) => res.json(rooms));
-app.get('/api/news', (_req, res) => res.json(news));
-app.get('/api/reservations', async (req, res) => {
-  if (!isOwner(req)) return res.status(401).json({ message: 'Доступ запрещён' });
-  if (!pool) return res.status(503).json({ message: 'DATABASE_URL не настроен' });
-  const result = await pool.query('SELECT * FROM reservations ORDER BY created_at DESC');
-  res.json(result.rows.map(reservationFromRow));
-});
-app.get('/api/reservations/:id/status', async (req, res) => {
-  if (!pool) return res.status(503).json({ message: 'База данных пока не подключена' });
-  const result = await pool.query('SELECT id, room_id, reservation_time, status FROM reservations WHERE id = $1 AND client_token = $2', [req.params.id, req.query.token]);
-  if (!result.rows[0]) return res.status(404).json({ message: 'Заявка не найдена' });
-  res.json({ id: Number(result.rows[0].id), roomId: result.rows[0].room_id, time: result.rows[0].reservation_time, status: result.rows[0].status });
-});
-app.post('/api/reservations', async (req, res) => {
-  const { name, phone, roomId, time } = req.body || {};
-  const normalizedPhone = String(phone || '').replace(/\D/g, '');
-  if (!name || !phone || !roomId || !time) return res.status(400).json({ message: 'Заполните имя, телефон, зал и время' });
-  if (normalizedPhone.length !== 11 || !normalizedPhone.startsWith('7')) return res.status(400).json({ message: 'Введите номер в формате +7 (___) ___ __ __' });
-  if (!pool) return res.status(503).json({ message: 'База данных пока не подключена' });
-  const clientToken = crypto.randomUUID();
-  const result = await pool.query('INSERT INTO reservations (name, phone, room_id, reservation_time, client_token) VALUES ($1, $2, $3, $4, $5) RETURNING *', [name.trim(), `+${normalizedPhone}`, Number(roomId), time, clientToken]);
-  res.status(201).json(reservationFromRow(result.rows[0]));
-});
-app.patch('/api/reservations/:id', async (req, res) => {
-  if (!isOwner(req)) return res.status(401).json({ message: 'Доступ запрещён' });
-  if (!pool) return res.status(503).json({ message: 'DATABASE_URL не настроен' });
-  const result = await pool.query('SELECT * FROM reservations WHERE id = $1', [req.params.id]);
-  if (!result.rows[0]) return res.status(404).json({ message: 'Бронь не найдена' });
-  const reservation = reservationFromRow(result.rows[0]);
-  reservation.status = req.body.status === 'approved' ? 'approved' : 'rejected';
-  if (reservation.status === 'approved') {
-    const room = rooms.find((item) => item.id === reservation.roomId);
-    if (room) { room.status = 'busy'; room.guest = reservation.name; room.occupiedUntil = Date.now() + 60 * 60 * 1000; }
-  }
-  const updated = await pool.query('UPDATE reservations SET status = $1 WHERE id = $2 RETURNING *', [reservation.status, reservation.id]);
-  res.json(reservationFromRow(updated.rows[0]));
-});
-app.post('/api/news', (req, res) => {
-  if (!isOwner(req)) return res.status(401).json({ message: 'Доступ запрещён' });
-  const { title, text } = req.body || {};
-  if (!title || !text) return res.status(400).json({ message: 'Заполните заголовок и текст' });
-  const item = { id: Date.now(), title, text, date: new Date().toLocaleDateString('ru-RU') };
-  news.unshift(item); res.status(201).json(item);
-});
 app.use(express.static(path.join(__dirname, 'dist')));
-app.use((_req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html')));
-initDatabase().then(() => app.listen(port, () => console.log(`RESTART server listening on ${port}`))).catch((error) => {
-  console.error('PostgreSQL initialization failed:', error.message);
-  process.exit(1);
+
+// Инициализация таблиц БД при запуске
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id INT PRIMARY KEY,
+        status VARCHAR(20) DEFAULT 'free',
+        occupied_until BIGINT DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS news (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        text TEXT NOT NULL,
+        date VARCHAR(50) NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reservations (
+        id SERIAL PRIMARY KEY,
+        room_id INT NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        phone VARCHAR(50) NOT NULL,
+        time VARCHAR(50) NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        client_token VARCHAR(100) NOT NULL
+      );
+    `);
+
+    // Заполнение начальных VIP залов (4 зала)
+    const { rowCount } = await pool.query('SELECT * FROM rooms');
+    if (rowCount === 0) {
+      for (let i = 1; i <= 4; i++) {
+        await pool.query('INSERT INTO rooms (id, status) VALUES ($1, $2)', [i, 'free']);
+      }
+    }
+  } catch (err) {
+    console.error('Ошибка инициализации БД:', err);
+  }
+}
+
+initDB();
+
+// Middleware для проверки прав владельца
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (authHeader === `Bearer ${OWNER_TOKEN}`) {
+    next();
+  } else {
+    res.status(401).json({ message: 'Неверный токен доступа' });
+  }
+}
+
+// --- API ENDPOINTS ---
+
+// Авторизация владельца
+app.post('/api/auth/login', (req, res) => {
+  const { login, password } = req.body;
+  if (login === OWNER_LOGIN && password === OWNER_PASSWORD) {
+    res.json({ token: OWNER_TOKEN });
+  } else {
+    res.status(401).json({ message: 'Неверный логин или пароль' });
+  }
+});
+
+// Получить список VIP залов
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id, status, occupied_until AS "occupiedUntil" FROM rooms ORDER BY id ASC');
+    const rooms = rows.map(r => ({
+      ...r,
+      occupiedUntil: Number(r.occupiedUntil)
+    }));
+    res.json(rooms);
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка загрузки залов' });
+  }
+});
+
+// Получить новости
+app.get('/api/news', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM news ORDER BY id DESC');
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка загрузки новостей' });
+  }
+});
+
+// Добавить новость (Только владелец)
+app.post('/api/news', authMiddleware, async (req, res) => {
+  const { title, text } = req.body;
+  const date = new Date().toLocaleDateString('ru-RU');
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO news (title, text, date) VALUES ($1, $2, $3) RETURNING *',
+      [title, text, date]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка публикации новости' });
+  }
+});
+
+// Создать заявку на бронь
+app.post('/api/reservations', async (req, res) => {
+  const { roomId, name, phone, time } = req.body;
+  const clientToken = Math.random().toString(36).substring(2) + Date.now().toString(36);
+
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO reservations (room_id, name, phone, time, client_token) VALUES ($1, $2, $3, $4, $5) RETURNING id, client_token AS "clientToken"',
+      [roomId, name, phone, time, clientToken]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка создания брони' });
+  }
+});
+
+// Проверить статус заявки (Для клиента)
+app.get('/api/reservations/:id/status', async (req, res) => {
+  const { id } = req.params;
+  const { token } = req.query;
+
+  try {
+    const { rows } = await pool.query(
+      'SELECT status FROM reservations WHERE id = $1 AND client_token = $2',
+      [id, token]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ message: 'Заявка не найдена' });
+    }
+    res.json({ status: rows[0].status });
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка проверки статуса' });
+  }
+});
+
+// Получить все заявки (Только владелец)
+app.get('/api/reservations', authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, room_id AS "roomId", name, phone, time, status FROM reservations ORDER BY id DESC'
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка получения заявок' });
+  }
+});
+
+// Изменить статус заявки (Подтвердить / Отклонить)
+app.patch('/api/reservations/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  try {
+    await pool.query('UPDATE reservations SET status = $1 WHERE id = $2', [status, id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка обновления статуса' });
+  }
+});
+
+// Раздача SPA фронтенда Vite (Client-side routing)
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Сервер RESTART PS CLUB запущен на порту ${PORT}`);
 });
